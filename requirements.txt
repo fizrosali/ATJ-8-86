@@ -1,0 +1,6 @@
+requirements.txt
+----------------
+streamlit
+pypdf
+scikit-learn
+openai
