@@ -1,72 +1,51 @@
-"""
-ATJ Web App v2 — Practical 3D + Explanations + PDF Extracts (Streamlit)
-=========================================================================
-
-What this does
---------------
-- **SSD on grade (3D):** Real‑world inputs (speed, grade, reaction time, friction) → live 3D scene + computed distances.
-- **Curve & superelevation (3D):** Inputs (speed, radius, f_max, e_max) → required e(%), pass/fail, live 3D scene.
-- **PDF extracts:** Auto‑pull relevant, page‑numbered text snippets from your bundled ATJ PDF for each tool, with highlights.
-- **Free Q&A:** Quick keyword search over the PDF with page numbers and full‑page viewer.
-- **Grounding:** This is an educational companion; always verify against the official PDF.
-
-Repo layout
------------
-- app.py  (this file)
-- BPIS_ATJ_8-86_19062020.pdf  (place at repo root or change PDF_PATH)
-- requirements.txt  (streamlit, pypdf, scikit-learn, plotly, numpy, openai [optional])
-
-Run locally
------------
-    pip install -r requirements.txt
-    streamlit run app.py
-
-Optional OpenAI composition (still grounded): set env vars `OPENAI_API_KEY`, `OPENAI_MODEL`.
-"""
+# ATJ Web App v2 — Practical 3D + Cars + PDF Extracts (Streamlit)
+# ---------------------------------------------------------------
+# Tabs:
+# 1) Stopping Sight Distance (SSD) on grade — car visual, brake line, headlight line
+# 2) Horizontal Curve & Superelevation — banked road, car on curve, required e
+# 3) Free Q&A — TF-IDF search over ATJ PDF
+#
+# PDF extracts: shows page + snippet matching current topic and inputs
+# OpenAI optional via env vars OPENAI_API_KEY/OPENAI_MODEL (not required)
 
 from __future__ import annotations
-import io
-import os
-import re
+import io, os, re, math
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 
 import numpy as np
 import streamlit as st
+import plotly.graph_objects as go
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import plotly.graph_objects as go
 
-# -------------------- Optional OpenAI (env vars; safe if not set) --------------------
+# ================= Basic config =================
+st.set_page_config(page_title="ATJ 8/86 — Practical Road Lab", page_icon="🚗", layout="wide")
+PDF_PATH = "BPIS_ATJ_8-86_19062020.pdf"       # place your PDF at repo root
+SIM_THRESHOLD = 0.14                           # refusal cutoff for weak retrieval
+RESULT_SNIPPETS = 4
+
+# =============== Optional OpenAI (disabled by default) ===============
 USE_OPENAI = False
-client = None
+MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 try:
     from openai import OpenAI
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    if OPENAI_API_KEY:
-        client = OpenAI(api_key=OPENAI_API_KEY)
+    _key = os.getenv("OPENAI_API_KEY")
+    if _key:
+        oai = OpenAI(api_key=_key)
         USE_OPENAI = True
 except Exception:
     USE_OPENAI = False
-MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# ---------------------------------- Config ----------------------------------
-PDF_PATH = "BPIS_ATJ_8-86_19062020.pdf"   # your bundled guideline (adjust path if needed)
-SIM_THRESHOLD = 0.14                       # weak‑evidence cutoff for refusal in Q&A
-MAX_SNIPPETS = 6
-G = 9.81                                   # gravity (m/s^2)
-
-st.set_page_config(page_title="ATJ 8/86 — Practical 3D & Reference", page_icon="🛣️", layout="wide")
-
-# --------------------------------- Helpers ----------------------------------
+# ================= PDF loading & retrieval =================
 @dataclass
 class Chunk:
     page: int
     text: str
 
 @st.cache_data(show_spinner=False)
-def load_pdf(path: str) -> Tuple[List[str], List[Chunk]]:
+def load_pdf_text(path: str) -> Tuple[List[str], List[Chunk]]:
     if not os.path.exists(path):
         return [], []
     with open(path, "rb") as f:
@@ -77,253 +56,301 @@ def load_pdf(path: str) -> Tuple[List[str], List[Chunk]]:
     for i, p in enumerate(reader.pages):
         t = p.extract_text() or ""
         pages.append(t)
-        for line in (t.split("\n") if t else []):
-            s = line.strip()
-            if len(s) > 30:
+        for line in t.split("\n"):
+            s = (line or "").strip()
+            if len(s) > 40:
                 chunks.append(Chunk(page=i+1, text=s))
     return pages, chunks
 
 @st.cache_data(show_spinner=False)
-def build_index(chunks: List[Chunk]):
+def build_tfidf(chunks: List[Chunk]):
     corpus = [c.text for c in chunks]
     if not corpus:
         return None, None
-    vectorizer = TfidfVectorizer(stop_words="english")
-    X = vectorizer.fit_transform(corpus)
-    return vectorizer, X
+    vec = TfidfVectorizer(stop_words="english")
+    X = vec.fit_transform(corpus)
+    return vec, X
 
-def search_snippets(vectorizer, X, chunks: List[Chunk], query: str, k: int = 5):
-    if vectorizer is None or X is None or not query.strip():
+def search_snippets(query: str, vec, X, chunks: List[Chunk], topk=RESULT_SNIPPETS) -> List[Tuple[float, Chunk]]:
+    if (not query) or (vec is None):
         return []
-    q_vec = vectorizer.transform([query])
-    sims = cosine_similarity(q_vec, X).ravel()
-    order = sims.argsort()[::-1][:k]
-    return [(float(sims[i]), chunks[i]) for i in order]
-
-_def_hl_css = "<div style='white-space:pre-wrap; font-family: ui-monospace, monospace;'>"  # noqa
+    qv = vec.transform([query])
+    sims = cosine_similarity(qv, X).ravel()
+    # best per page
+    best: Dict[int, Tuple[float, Chunk]] = {}
+    for score, ch in zip(sims, chunks):
+        cur = best.get(ch.page)
+        if (cur is None) or (score > cur[0]):
+            best[ch.page] = (float(score), ch)
+    out = sorted(best.values(), key=lambda x: x[0], reverse=True)[:topk]
+    return out
 
 def highlight(text: str, query: str) -> str:
     terms = [re.escape(t) for t in (query or "").split() if t.strip()]
     if not terms:
         return text
     pattern = re.compile(r"(" + r"|".join(terms) + r")", re.IGNORECASE)
-    return pattern.sub(r"<mark>\1</mark>", text)
+    return pattern.sub(r"<mark>\\1</mark>", text)
 
-# ----------------------------- Engineering calcs -----------------------------
+PAGES, CHUNKS = load_pdf_text(PDF_PATH)
+VEC, X = build_tfidf(CHUNKS)
 
-def calc_ssd(v_kmh: float, t_react: float, f: float, grade_percent: float) -> Dict[str, float]:
-    """Compute SSD on grade using a common formulation.
-    SSD = v*t + v^2 / (2*g*(f ± G)), with G=grade as decimal (+ upgrade, - downgrade).
+# ===================== Road math (practical) =====================
+G = 9.81  # m/s^2
+
+def kmh_to_ms(v_kmh: float) -> float:
+    return v_kmh / 3.6
+
+def ssd_on_grade(v_kmh: float, t_react: float, f: float, grade_percent: float) -> float:
     """
-    v = max(0.0, v_kmh) / 3.6  # m/s
-    Gd = grade_percent / 100.0
-    # Effective deceleration term
-    denom = f + Gd
-    if denom <= 1e-6:  # avoid divide-by-zero/negative (extreme steep downgrade with low f)
-        braking = float("inf")
-    else:
-        braking = (v**2) / (2.0 * G * denom)
-    reaction = v * t_react
-    ssd = reaction + braking
-    return {"v_mps": v, "reaction": reaction, "braking": braking, "ssd": ssd}
-
-
-def ssd_scene(v_kmh: float, grade_percent: float, ssd: float, lane_w: float = 3.5, lanes: int = 2):
-    """3D scene: sloped road (grade), car at x=0, object at x=SSD."""
-    total_w = lane_w * lanes
-    slope = np.tan(np.arctan(grade_percent / 100.0))  # approx G as slope
-    xlen = max(30.0, ssd * 1.2)
-    x = np.linspace(0, xlen, 40)
-    y = np.linspace(-total_w/2, total_w/2, 12)
-    X, Y = np.meshgrid(x, y)
-    Z = slope * X
-
-    road = go.Surface(x=X, y=Y, z=Z, opacity=0.9)
-    # Centerline and markers
-    line = go.Scatter3d(x=[0, xlen], y=[0, 0], z=[0, slope*xlen], mode='lines', line=dict(width=6))
-    car = go.Scatter3d(x=[0], y=[0], z=[0], mode='markers', marker=dict(size=6))
-    obj = go.Scatter3d(x=[ssd], y=[0], z=[slope*ssd], mode='markers', marker=dict(size=6))
-
-    fig = go.Figure(data=[road, line, car, obj])
-    fig.update_layout(scene=dict(
-        xaxis_title='Distance along road (m)', yaxis_title='Offset (m)', zaxis_title='Elevation (m)'
-    ), margin=dict(l=0, r=0, t=0, b=0))
-    return fig
-
-
-def calc_required_e(v_kmh: float, R: float, f_max: float) -> float:
-    """Required superelevation e (decimal) from v^2/(gR) = e + f; e = v^2/(gR) - f.
-    Clamped to [0, 0.12] for display purposes.
+    SSD = v * t + v^2 / (2*g*(f ± G))
+    G positive for upgrade reduces stopping distance (resists motion)
+    Here: grade_percent positive = upgrade; negative = downgrade
     """
-    v = max(0.0, v_kmh) / 3.6
-    e_req = (v*v) / (G * R) - f_max
-    return float(np.clip(e_req, 0.0, 0.12))
+    v = kmh_to_ms(v_kmh)
+    Ggrade = (grade_percent / 100.0)
+    denom = 2 * G * (f + Ggrade)  # upgrade -> +Ggrade, downgrade -> -|G| (by sign in input)
+    # more standard: SSD = v*t + v^2 / (2g (f ± G)), if downgrade use (f - |G|)
+    # We'll implement using sign of grade_percent:
+    if grade_percent < 0:
+        denom = 2 * G * (f - abs(Ggrade))
+    braking = v**2 / max(denom, 1e-6)
+    return v * t_react + max(braking, 0.0)
 
+def e_required(v_kmh: float, R: float, f: float) -> float:
+    """
+    From lateral equilibrium: e + f = v^2/(gR)
+    Return e_required (decimal). Clip to [0, 0.12] (typical design envelope).
+    """
+    v = kmh_to_ms(v_kmh)
+    e = (v**2) / (G * R) - f
+    return float(np.clip(e, 0.0, 0.12))
 
-def superelevated_road(e: float, radius: float = 250.0, arc_len: float = 120.0, lane_w: float = 3.5, lanes: int = 2):
-    """3D surface of an arced, superelevated roadway (constant e)."""
-    total_w = lane_w * lanes
-    theta = arc_len / radius  # radians
-    t = np.linspace(0, theta, 160)
-    x = radius * np.sin(t)
-    y = radius * (1 - np.cos(t))
-    # Local road coordinates: along-arc s vs offset y_off; rotate offset by e
-    s = np.linspace(0, arc_len, 40)
-    y_off = np.linspace(-total_w/2, total_w/2, 16)
-    S, Y = np.meshgrid(s, y_off)
-    Z = -e * (Y)  # tilt about centerline
+# ===================== 3D builders (cars & roads) =====================
+def car_mesh(center=(0,0,0), L=4.4, W=1.8, H=1.5, yaw_deg=0.0, color="red", name="car"):
+    """
+    Simple box car body as Mesh3d; center at (x,y,z), yaw about z.
+    """
+    cx, cy, cz = center
+    yaw = math.radians(yaw_deg)
+    dx = L/2; dy = W/2; dz = H
+    corners = np.array([
+        [-dx,-dy,0],[ dx,-dy,0],[ dx, dy,0],[-dx, dy,0],  # bottom
+        [-dx,-dy,dz],[ dx,-dy,dz],[ dx, dy,dz],[-dx, dy,dz] # top
+    ], dtype=float)
+    # rotate yaw
+    rot = np.array([[ math.cos(yaw), -math.sin(yaw), 0],
+                    [ math.sin(yaw),  math.cos(yaw), 0],
+                    [ 0, 0, 1]])
+    corners = corners @ rot.T
+    corners += np.array([cx, cy, cz])
+    x, y, z = corners.T
+    # faces (triangles)
+    I = [0,0,0, 1,2,3, 4,4,4, 5,6,7, 0,1,5, 4,5,6, 6,7,3, 7,4,0]  # will be corrected with J,K
+    # Define rectangular faces explicitly (12 triangles):
+    I = [0,1,2, 0,2,3,  # bottom
+         4,5,6, 4,6,7,  # top
+         0,1,5, 0,5,4,  # side
+         1,2,6, 1,6,5,
+         2,3,7, 2,7,6,
+         3,0,4, 3,4,7]
+    J = [1,2,3, 2,3,0,
+         5,6,7, 6,7,4,
+         1,5,4, 5,4,0,
+         2,6,5, 6,5,1,
+         3,7,6, 7,6,2,
+         0,4,7, 4,7,3]
+    K = [2,3,0, 3,0,1,
+         6,7,4, 7,4,5,
+         5,4,0, 4,0,1,
+         6,5,1, 5,1,2,
+         7,6,2, 6,2,3,
+         4,7,3, 7,3,0]
+    return go.Mesh3d(x=x, y=y, z=z, i=I, j=J, k=K, color=color, opacity=0.95, name=name)
 
-    # Map S back to (x,y) along the precomputed plan arc by nearest indices
-    idx = (S / arc_len * (len(t)-1)).astype(int)
-    XX = x[idx]
-    YY = y[idx]
+def road_plane(length=200, width=8, grade_percent=0.0, bank_e=0.0, center=(0,0,0), name="road", color="#808080"):
+    """
+    Road as a slightly-tesselated plane so we can tilt along x (grade) and bank along y (superelevation).
+    length along +x; width along y; grade tilts in x-z; bank tilts across y-z.
+    """
+    L = int(max(10, length//5))
+    W = 6
+    xs = np.linspace(0, length, L)
+    ys = np.linspace(-width/2, width/2, W)
+    X, Y = np.meshgrid(xs, ys)
+    gx = math.tan(math.radians(math.atan(grade_percent/100.0)*180/math.pi))  # but easier: z = x * tan(theta)
+    # Simplify: z grade via slope = grade_percent/100
+    z_grade = (grade_percent/100.0) * X
+    # bank (superelevation) rotates crossfall: z varies linearly with Y
+    z_bank = bank_e * Y
+    Z = z_grade + z_bank + center[2]
+    return go.Surface(x=X+center[0], y=Y+center[1], z=Z, colorscale=[[0,color],[1,color]], showscale=False, opacity=0.85, name=name)
 
-    road = go.Surface(x=XX, y=YY + Y, z=Z, opacity=0.92)
-    center = go.Scatter3d(x=x, y=y, z=0*y, mode='lines', line=dict(width=6))
+def headlight_ray(x0, y0, z0, pitch_deg=-1.0, length=120.0, name="headlight"):
+    """Simple ray from car front representing headlight/sight line."""
+    pitch = math.radians(pitch_deg)
+    xs = np.linspace(0, length, 50)
+    ys = np.zeros_like(xs)
+    zs = xs*math.tan(pitch)
+    return go.Scatter3d(x=x0+xs, y=y0+ys, z=z0+zs, mode="lines", line=dict(width=6), name=name)
 
-    fig = go.Figure(data=[road, center])
-    fig.update_layout(scene=dict(
-        xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='Elevation (m)'
-    ), margin=dict(l=0, r=0, t=0, b=0))
-    return fig
+# ================ UI =================
+st.title("🚗 ATJ 8/86 — Practical Road Lab")
 
-# ----------------------------- Load + Index -----------------------------
-pages_text, chunks = load_pdf(PDF_PATH)
-vectorizer, X = build_index(chunks)
+tabs = st.tabs(["Stopping Sight Distance (SSD) on Grade", "Horizontal Curve & Superelevation", "Free Q&A (ATJ PDF)"])
 
-# --------------------------------- UI -----------------------------------
-st.sidebar.title("ATJ 8/86 — Tools")
-view = st.sidebar.radio("Choose view", ["SSD on Grade", "Curve & Superelevation", "Free Q&A", "About"], index=0)
+# ---------- Tab 1: SSD ----------
+with tabs[0]:
+    colL, colR = st.columns([0.52, 0.48])
+    with colL:
+        st.subheader("Inputs")
+        v = st.slider("Speed (km/h)", 30, 140, 90, 5)
+        t = st.slider("Perception–Reaction time t (s)", 1.0, 3.0, 2.5, 0.1)
+        f = st.slider("Longitudinal friction f", 0.20, 0.50, 0.35, 0.01)
+        grade = st.slider("Grade (%): + upgrade, − downgrade", -8, 8, 0, 1)
+        lane_w = st.slider("Lane width (m)", 3.0, 4.0, 3.5, 0.1)
+        car_h = st.slider("Driver eye height (m)", 0.9, 1.5, 1.1, 0.05)
+        # compute
+        ssd = ssd_on_grade(v, t, f, grade)
+        st.metric("Calculated SSD (m)", f"{ssd:,.1f}")
+        st.caption("Formula: SSD = v·t + v² / (2·g·(f ± G)). Downgrade uses (f − |G|).")
+        # pull PDF extracts
+        q_topic = "stopping sight distance braking grade"
+        results = search_snippets(q_topic, VEC, X, CHUNKS, topk=RESULT_SNIPPETS)
+        if results and results[0][0] >= SIM_THRESHOLD:
+            st.write("**ATJ extracts (related):**")
+            for i, (score, ch) in enumerate(results):
+                st.markdown(f"- *(p.{ch.page}, score={score:.3f})* {highlight(ch.text, 'stopping sight distance')}", unsafe_allow_html=True)
+        elif PAGES:
+            st.info("No strong snippet found. Try searching in the Q&A tab for exact wording.")
 
-# =============================== SSD on Grade ===============================
-if view == "SSD on Grade":
-    st.title("🛑 Stopping Sight Distance on Grade — 3D & Reference")
+    with colR:
+        st.subheader("3D road & car (SSD demo)")
+        road_len = max(120.0, ssd + 40.0)   # ensure the stopping line is visible
+        # Build road with grade
+        plane = road_plane(length=road_len, width=2*lane_w, grade_percent=grade, bank_e=0.0, center=(0,0,0))
+        # Place car near x=10
+        car_front_bumper_to_cg = 1.0
+        car = car_mesh(center=(10.0, 0.0, 0.0), L=4.4, W=1.8, H=1.5, yaw_deg=0, color="crimson")
+        # Stopping line at SSD from front bumper
+        stop_x = 10.0 + ssd
+        stop = go.Scatter3d(x=[stop_x, stop_x], y=[-lane_w/2, lane_w/2], z=[(grade/100.0)*stop_x]*2,
+                            mode="lines", line=dict(width=12), name="Stopping line")
+        # Headlight/sight line from approx headlight height (driver eye line demo)
+        headlight_height = car_h
+        ray = headlight_ray(x0=10.0, y0=0.0, z0=headlight_height, pitch_deg=-1.0, length=road_len-10.0, name="Sight/Headlight")
 
-    cols = st.columns([1,1,1,1,1])
-    with cols[0]: v_kmh = st.number_input("Speed (km/h)", 10.0, 140.0, 80.0, 1.0)
-    with cols[1]: grade = st.number_input("Grade (%)  (+up / −down)", -12.0, 12.0, 0.0, 0.5)
-    with cols[2]: t_react = st.number_input("Reaction time t (s)", 0.5, 3.5, 2.5, 0.1)
-    with cols[3]: f = st.number_input("Friction f", 0.10, 0.60, 0.35, 0.01)
-    with cols[4]: lanes = st.slider("Lanes shown", 1, 4, 2)
-
-    out = calc_ssd(v_kmh, t_react, f, grade)
-    ssd = out["ssd"]
-
-    m1, m2 = st.columns([2,1])
-    with m1:
-        fig = ssd_scene(v_kmh, grade, ssd, lanes=lanes)
+        fig = go.Figure(data=[plane, car, stop, ray])
+        fig.update_layout(
+            scene=dict(
+                xaxis_title="x (m)",
+                yaxis_title="y (m)",
+                zaxis_title="z (m)",
+                aspectmode="manual",
+                aspectratio=dict(x=2, y=0.6, z=0.25),
+            ),
+            margin=dict(l=0, r=0, t=0, b=0),
+        )
         st.plotly_chart(fig, use_container_width=True)
-    with m2:
-        st.subheader("Results")
-        st.metric("Reaction distance (m)", f"{out['reaction']:.1f}")
-        st.metric("Braking distance (m)", f"{(np.inf if np.isinf(out['braking']) else round(out['braking'],1))}")
-        st.metric("SSD (m)", f"{(np.inf if np.isinf(ssd) else round(ssd,1))}")
-        if np.isinf(ssd):
-            st.warning("Parameters produce unrealistic SSD (denominator ≤ 0). Increase f or reduce downgrade.")
+        st.caption("Move the sliders to see how SSD shifts the stopping line and how grade changes road elevation.")
 
-    # PDF extracts for SSD keywords
-    st.divider()
-    st.subheader("PDF extracts — related to SSD & grades")
-    queries = ["stopping sight distance", "SSD", "grade", "braking", "perception reaction time"]
-    qtext = "; ".join(queries)
-    if pages_text:
-        hits = search_snippets(vectorizer, X, chunks, " ".join(queries), k=5)
-        for i, (score, ch) in enumerate(hits):
-            with st.expander(f"p.{ch.page} · score={score:.3f} · #{i}"):
-                st.markdown(highlight(ch.text, qtext), unsafe_allow_html=True)
-                if st.button(f"View page {ch.page}", key=f"ssd_view_{ch.page}_{i}"):
-                    st.session_state["selected_page"] = ch.page
-        if "selected_page" in st.session_state:
-            p = st.session_state["selected_page"]
-            st.markdown(f"**Full page {p}**")
-            st.markdown(_def_hl_css + highlight(pages_text[p-1], qtext) + "</div>", unsafe_allow_html=True)
-    else:
-        st.info(f"PDF not found at {PDF_PATH}.")
+# ---------- Tab 2: Curve & Superelevation ----------
+with tabs[1]:
+    colL, colR = st.columns([0.52, 0.48])
+    with colL:
+        st.subheader("Inputs")
+        v2 = st.slider("Speed (km/h)", 30, 140, 80, 5, key="v2")
+        R = st.slider("Curve radius R (m)", 60, 1500, 300, 10)
+        f_lat = st.slider("Lateral friction f", 0.05, 0.20, 0.12, 0.01)
+        e_set = st.slider("Provided superelevation e (decimal)", 0.00, 0.12, 0.06, 0.01)
+        lane_w2 = st.slider("Lane + shoulder width modeled (m)", 3.0, 8.0, 6.0, 0.1)
+        # computes
+        e_need = e_required(v2, R, f_lat)
+        demand = (kmh_to_ms(v2)**2)/(G*R)
+        st.metric("Required e (decimal)", f"{e_need:.3f}")
+        st.metric("Demand (e + f)", f"{demand:.3f}")
+        ok = (e_set + f_lat) >= demand
+        st.success("OK: Provided e + f meets demand ✅" if ok else "Not OK: Increase e or reduce speed/radius ❌")
+        # extracts
+        q_topic2 = "superelevation horizontal curve friction"
+        results2 = search_snippets(q_topic2, VEC, X, CHUNKS, topk=RESULT_SNIPPETS)
+        if results2 and results2[0][0] >= SIM_THRESHOLD:
+            st.write("**ATJ extracts (related):**")
+            for i, (score, ch) in enumerate(results2):
+                st.markdown(f"- *(p.{ch.page}, score={score:.3f})* {highlight(ch.text, 'superelevation curve')}", unsafe_allow_html=True)
+        elif PAGES:
+            st.info("No strong snippet found. Try the Q&A tab for exact phrasing.")
 
-# ============================ Curve & Superelevation ============================
-elif view == "Curve & Superelevation":
-    st.title("↪️ Horizontal Curve & Superelevation — 3D & Reference")
+    with colR:
+        st.subheader("3D banked curve with car")
+        # Make a short arc of the curve as a banked ribbon
+        theta_span = max(20.0, min(120.0, 60.0 * (300.0/R)))  # shorter arc for big R
+        theta = np.linspace(0, math.radians(theta_span), 80)
+        x_arc = R*np.sin(theta)
+        y_arc = R*(1 - np.cos(theta))
+        # Apply banking: crossfall e_set across width
+        width = lane_w2
+        y_left = y_arc - width/2
+        y_right = y_arc + width/2
+        z_left = -e_set*(width/2)
+        z_right = e_set*(width/2)
+        # Create ribbon surface by sweeping along arc
+        X = np.vstack([x_arc, x_arc])
+        Y = np.vstack([y_left, y_right])
+        Z = np.vstack([np.full_like(x_arc, z_left), np.full_like(x_arc, z_right)])
 
-    c1, c2, c3, c4 = st.columns([1,1,1,1])
-    with c1: v_kmh = st.number_input("Speed (km/h)", 20.0, 140.0, 80.0, 1.0, key="curve_v")
-    with c2: R = st.number_input("Radius R (m)", 30.0, 2000.0, 250.0, 5.0)
-    with c3: f_max = st.number_input("Max side friction f", 0.05, 0.25, 0.15, 0.01)
-    with c4: e_max = st.number_input("Max superelevation e_max (%)", 2.0, 12.0, 8.0, 0.5)
+        road = go.Surface(x=X, y=Y, z=Z, colorscale=[[0,"#808080"],[1,"#808080"]], showscale=False, opacity=0.9, name="Banked curve")
 
-    e_req = calc_required_e(v_kmh, R, f_max)  # decimal
-    e_max_dec = e_max / 100.0
-    ok = e_req <= e_max_dec + 1e-6
-
-    L_vis = st.slider("Visualized arc length (m)", 40.0, 300.0, 120.0, 5.0)
-    lanes = st.slider("Lanes shown", 1, 4, 2, key="curve_lanes")
-    lane_w = st.number_input("Lane width (m)", 2.75, 4.00, 3.50, 0.05, key="curve_lane_w")
-
-    g1, g2 = st.columns([2,1])
-    with g1:
-        fig2 = superelevated_road(e=min(e_req, e_max_dec), radius=R, arc_len=L_vis, lane_w=lane_w, lanes=lanes)
+        # Place a car near start of arc, yaw aligned to tangent
+        yaw_deg = math.degrees(theta[10]) if len(theta) > 10 else 0.0
+        car2 = car_mesh(center=(x_arc[10], y_arc[10], 0.75*e_set*width/2), L=4.4, W=1.8, H=1.5, yaw_deg=yaw_deg, color="royalblue", name="car")
+        fig2 = go.Figure(data=[road, car2])
+        fig2.update_layout(
+            scene=dict(
+                xaxis_title="x (m)",
+                yaxis_title="y (m)",
+                zaxis_title="z (m)",
+                aspectmode="data",
+            ),
+            margin=dict(l=0, r=0, t=0, b=0),
+        )
         st.plotly_chart(fig2, use_container_width=True)
-    with g2:
-        st.subheader("Results")
-        st.metric("Required e (%)", f"{100*e_req:.2f}")
-        st.metric("Allowed e_max (%)", f"{e_max:.2f}")
-        st.success("Within e_max") if ok else st.error("Exceeds e_max — increase R or reduce speed.")
+        st.caption("Demand = v²/(gR). You supply e and f. Increase e or reduce speed if demand > e+f.")
 
-    # PDF extracts for curve & e
-    st.divider()
-    st.subheader("PDF extracts — curves & superelevation")
-    queries = ["superelevation", "side friction", "horizontal curve", "minimum radius", "e ="]
-    qtext = "; ".join(queries)
-    if pages_text:
-        hits = search_snippets(vectorizer, X, chunks, " ".join(queries), k=5)
-        for i, (score, ch) in enumerate(hits):
-            with st.expander(f"p.{ch.page} · score={score:.3f} · #{i}"):
-                st.markdown(highlight(ch.text, qtext), unsafe_allow_html=True)
-                if st.button(f"View page {ch.page}", key=f"curve_view_{ch.page}_{i}"):
-                    st.session_state["selected_page"] = ch.page
-        if "selected_page" in st.session_state:
-            p = st.session_state["selected_page"]
-            st.markdown(f"**Full page {p}**")
-            st.markdown(_def_hl_css + highlight(pages_text[p-1], qtext) + "</div>", unsafe_allow_html=True)
-    else:
-        st.info(f"PDF not found at {PDF_PATH}.")
-
-# ================================== Free Q&A ==================================
-elif view == "Free Q&A":
-    st.title("🔎 Free Q&A over the PDF")
-
-    strict = st.sidebar.checkbox("Strict mode (refuse if weak evidence)", value=True, key="qa_strict")
-    k = st.sidebar.slider("Snippets to use", 1, MAX_SNIPPETS, 5, key="qa_k")
-
-    q = st.text_input("Ask a question", placeholder="e.g., Define transition curve or SSD factors").strip()
-    if st.button("Search", use_container_width=True, key="qa_btn") and q:
-        if vectorizer is None:
-            st.error("Index not built (PDF missing)")
+# ---------- Tab 3: Free Q&A ----------
+with tabs[2]:
+    st.subheader("Ask ATJ (PDF grounded)")
+    query = st.text_input("Your question", placeholder="e.g., Define stopping sight distance and list key factors.")
+    strict = st.checkbox("Strict mode (refuse weak evidence)", value=True)
+    if st.button("Search"):
+        if not CHUNKS:
+            st.error("PDF not found or text not extracted. Place the PDF at the repo root as 'BPIS_ATJ_8-86_19062020.pdf'.")
         else:
-            hits = search_snippets(vectorizer, X, chunks, q, k=k)
+            hits = search_snippets(query, VEC, X, CHUNKS, topk=RESULT_SNIPPETS)
             if not hits:
                 st.warning("No matches found.")
             else:
-                best = hits[0][0]
-                if strict and best < SIM_THRESHOLD:
+                best_score, best_chunk = hits[0]
+                if strict and best_score < SIM_THRESHOLD:
                     st.warning("Not in the guideline (ATJ 8/86).")
                 else:
-                    st.subheader("Top matches")
                     for i, (score, ch) in enumerate(hits):
-                        with st.expander(f"p.{ch.page} · score={score:.3f} · #{i}"):
-                            st.markdown(highlight(ch.text, q), unsafe_allow_html=True)
-                            if st.button(f"View page {ch.page}", key=f"qa_view_{ch.page}_{i}"):
-                                st.session_state["selected_page"] = ch.page
+                        with st.expander(f"p.{ch.page}  ·  score={score:.3f}  ·  #{i}"):
+                            st.markdown(highlight(ch.text, query), unsafe_allow_html=True)
+                    if USE_OPENAI:
+                        context = "\n\n".join([f"(p.{c.page}) {c.text}" for _, c in hits])
+                        try:
+                            resp = oai.chat.completions.create(
+                                model=MODEL_NAME,
+                                messages=[
+                                    {"role": "system", "content": "Answer ONLY from the ATJ context. Cite pages like (p.X). If absent, say 'Not in the guideline (ATJ 8/86)'."},
+                                    {"role": "user", "content": f"Question: {query}\n\nContext:\n{context}"}
+                                ],
+                                temperature=0.05,
+                            )
+                            st.markdown("### Composed answer")
+                            st.write(resp.choices[0].message.content)
+                        except Exception:
+                            st.info("OpenAI composition skipped (no key or API error).")
 
-                    if "selected_page" in st.session_state:
-                        p = st.session_state["selected_page"]
-                        st.markdown(f"**Full page {p}**")
-                        st.markdown(_def_hl_css + highlight(pages_text[p-1], q) + "</div>", unsafe_allow_html=True)
-
-# ==================================== About ====================================
-else:
-    st.title("About this app")
-    st.markdown(
-        "This interactive tool demonstrates practical highway design concepts with live 3D visuals and pulls related text from the bundled ATJ 8/86 PDF.\n"
-        "Use the extracts for *reference* and consult the official guideline for contractual decisions."
-    )
-    st.markdown("**Tips**:\n- Tune friction and grade to see SSD sensitivities.\n- Explore different R and speed to see superelevation needs.\n- Add your own queries in Free Q&A for quick lookups.")
+st.caption("Note: Visuals are illustrative. Always confirm with ATJ design tables and local practice.")
