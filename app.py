@@ -1,20 +1,27 @@
 """
-ATJ Web App v1 — Reference + Explanations + Basic 3D (Streamlit)
-================================================================
+ATJ Web App v2 — Practical 3D + Explanations + PDF Extracts (Streamlit)
+=========================================================================
 
-What you get in one file:
-- **Reference Q&A**: ask questions; answers grounded in the bundled ATJ PDF (TF‑IDF snippets)
-- **Topic Explorer**: curated explanations for major topics/subtopics (editable dictionary)
-- **3D Demos**: simple Plotly-based 3D visuals (superelevation crossfall, horizontal curve path)
+What this does
+--------------
+- **SSD on grade (3D):** Real‑world inputs (speed, grade, reaction time, friction) → live 3D scene + computed distances.
+- **Curve & superelevation (3D):** Inputs (speed, radius, f_max, e_max) → required e(%), pass/fail, live 3D scene.
+- **PDF extracts:** Auto‑pull relevant, page‑numbered text snippets from your bundled ATJ PDF for each tool, with highlights.
+- **Free Q&A:** Quick keyword search over the PDF with page numbers and full‑page viewer.
+- **Grounding:** This is an educational companion; always verify against the official PDF.
 
-Keep it vendor-neutral: this is an educational companion; for authoritative wording always refer to the PDF.
+Repo layout
+-----------
+- app.py  (this file)
+- BPIS_ATJ_8-86_19062020.pdf  (place at repo root or change PDF_PATH)
+- requirements.txt  (streamlit, pypdf, scikit-learn, plotly, numpy, openai [optional])
 
-Repo layout (minimal):
-- app.py (this file)
-- BPIS_ATJ_8-86_19062020.pdf  (bundled guideline)
-- requirements.txt  (streamlit, pypdf, scikit-learn, plotly, openai optional)
+Run locally
+-----------
+    pip install -r requirements.txt
+    streamlit run app.py
 
-Deploy: push to GitHub → Streamlit Community Cloud → pick app.py.
+Optional OpenAI composition (still grounded): set env vars `OPENAI_API_KEY`, `OPENAI_MODEL`.
 """
 
 from __future__ import annotations
@@ -24,13 +31,14 @@ import re
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 
+import numpy as np
 import streamlit as st
 from pypdf import PdfReader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import plotly.graph_objects as go
 
-# ============== Optional OpenAI (env vars; safe if not set) ==============
+# -------------------- Optional OpenAI (env vars; safe if not set) --------------------
 USE_OPENAI = False
 client = None
 try:
@@ -41,17 +49,17 @@ try:
         USE_OPENAI = True
 except Exception:
     USE_OPENAI = False
-
 MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# ============================ Config =====================================
-PDF_PATH = "BPIS_ATJ_8-86_19062020.pdf"   # ensure file exists at repo root
-SIM_THRESHOLD = 0.14                      # strictness cutoff for refusing answers
+# ---------------------------------- Config ----------------------------------
+PDF_PATH = "BPIS_ATJ_8-86_19062020.pdf"   # your bundled guideline (adjust path if needed)
+SIM_THRESHOLD = 0.14                       # weak‑evidence cutoff for refusal in Q&A
 MAX_SNIPPETS = 6
+G = 9.81                                   # gravity (m/s^2)
 
-st.set_page_config(page_title="ATJ 8/86 — Reference & 3D", page_icon="🛣️", layout="wide")
+st.set_page_config(page_title="ATJ 8/86 — Practical 3D & Reference", page_icon="🛣️", layout="wide")
 
-# ============================ Helpers ====================================
+# --------------------------------- Helpers ----------------------------------
 @dataclass
 class Chunk:
     page: int
@@ -84,6 +92,16 @@ def build_index(chunks: List[Chunk]):
     X = vectorizer.fit_transform(corpus)
     return vectorizer, X
 
+def search_snippets(vectorizer, X, chunks: List[Chunk], query: str, k: int = 5):
+    if vectorizer is None or X is None or not query.strip():
+        return []
+    q_vec = vectorizer.transform([query])
+    sims = cosine_similarity(q_vec, X).ravel()
+    order = sims.argsort()[::-1][:k]
+    return [(float(sims[i]), chunks[i]) for i in order]
+
+_def_hl_css = "<div style='white-space:pre-wrap; font-family: ui-monospace, monospace;'>"  # noqa
+
 def highlight(text: str, query: str) -> str:
     terms = [re.escape(t) for t in (query or "").split() if t.strip()]
     if not terms:
@@ -91,186 +109,221 @@ def highlight(text: str, query: str) -> str:
     pattern = re.compile(r"(" + r"|".join(terms) + r")", re.IGNORECASE)
     return pattern.sub(r"<mark>\1</mark>", text)
 
-# ===================== Topic Explorer content (editable) ==================
-TOPICS: Dict[str, Dict[str, str]] = {
-    "Fundamentals": {
-        "Design speed": "Design speed is the selected speed used to determine the geometric features of the road. It guides choices like curve radius, sight distance, and superelevation.",
-        "Lane & shoulder": "Typical lane width provides operating space while shoulders support stopped vehicles, lateral clearance, and structural support.",
-    },
-    "Sight distance": {
-        "Stopping sight distance (SSD)": "SSD is the minimum distance a driver needs to perceive, react, and brake to a stop before reaching an object in the path.",
-        "Overtaking / passing": "Passing sight distance is the length required for a safe overtaking manoeuvre on two-lane two-way roads under specified assumptions.",
-        "Decision sight distance": "Additional distance to allow complex decisions and manoeuvres at locations with high information load (e.g., exits).",
-    },
-    "Horizontal alignment": {
-        "Minimum radius": "For a given speed and superelevation, curves must satisfy a minimum radius to limit lateral acceleration and side friction.",
-        "Transition (spiral)": "Transition curves provide gradual change of curvature and superelevation, improving comfort and safety.",
-    },
-    "Vertical alignment": {
-        "Crest curve": "Crest vertical curves connect upgrades to downgrades. Length is often controlled by sight distance over the curve crest.",
-        "Sag curve": "Sag curves connect downgrades to upgrades; comfort/visibility at night (headlight control) often governs their length.",
-    },
-    "Crossfall & superelevation": {
-        "Normal crossfall": "Normal crown drains water away from the centreline on tangents.",
-        "Superelevation": "On curves, the pavement is rotated to an inward slope (e) to balance part of the lateral acceleration.",
-    },
-}
+# ----------------------------- Engineering calcs -----------------------------
 
-# =============================== 3D demos ================================
-def demo_superelevation(e_percent: float = 6.0, lane_width: float = 3.5, lanes: int = 2, length: float = 30.0):
-    """Simple 3D tilted plane to illustrate superelevation e (percent)."""
-    import numpy as np
-    total_width = lane_width * lanes
-    e = e_percent / 100.0
-    x = np.linspace(0, length, 20)
-    y = np.linspace(-total_width/2, total_width/2, 10)
+def calc_ssd(v_kmh: float, t_react: float, f: float, grade_percent: float) -> Dict[str, float]:
+    """Compute SSD on grade using a common formulation.
+    SSD = v*t + v^2 / (2*g*(f ± G)), with G=grade as decimal (+ upgrade, - downgrade).
+    """
+    v = max(0.0, v_kmh) / 3.6  # m/s
+    Gd = grade_percent / 100.0
+    # Effective deceleration term
+    denom = f + Gd
+    if denom <= 1e-6:  # avoid divide-by-zero/negative (extreme steep downgrade with low f)
+        braking = float("inf")
+    else:
+        braking = (v**2) / (2.0 * G * denom)
+    reaction = v * t_react
+    ssd = reaction + braking
+    return {"v_mps": v, "reaction": reaction, "braking": braking, "ssd": ssd}
+
+
+def ssd_scene(v_kmh: float, grade_percent: float, ssd: float, lane_w: float = 3.5, lanes: int = 2):
+    """3D scene: sloped road (grade), car at x=0, object at x=SSD."""
+    total_w = lane_w * lanes
+    slope = np.tan(np.arctan(grade_percent / 100.0))  # approx G as slope
+    xlen = max(30.0, ssd * 1.2)
+    x = np.linspace(0, xlen, 40)
+    y = np.linspace(-total_w/2, total_w/2, 12)
     X, Y = np.meshgrid(x, y)
-    Z = -e * (Y)  # tilt about centreline
-    surf = go.Surface(x=X, y=Y, z=Z, opacity=0.9)
-    fig = go.Figure(data=[surf])
+    Z = slope * X
+
+    road = go.Surface(x=X, y=Y, z=Z, opacity=0.9)
+    # Centerline and markers
+    line = go.Scatter3d(x=[0, xlen], y=[0, 0], z=[0, slope*xlen], mode='lines', line=dict(width=6))
+    car = go.Scatter3d(x=[0], y=[0], z=[0], mode='markers', marker=dict(size=6))
+    obj = go.Scatter3d(x=[ssd], y=[0], z=[slope*ssd], mode='markers', marker=dict(size=6))
+
+    fig = go.Figure(data=[road, line, car, obj])
     fig.update_layout(scene=dict(
-        xaxis_title='Chainage (m)', yaxis_title='Offset (m)', zaxis_title='Elevation (m)'
+        xaxis_title='Distance along road (m)', yaxis_title='Offset (m)', zaxis_title='Elevation (m)'
     ), margin=dict(l=0, r=0, t=0, b=0))
     return fig
 
-def demo_horizontal_curve(radius: float = 250.0, arc_length: float = 120.0):
-    """3D polyline showing a plan-view circular arc extruded flat at z=0."""
-    import numpy as np
-    theta = arc_length / radius  # radians if arc_length in m on circular arc
-    t = np.linspace(0, theta, 200)
+
+def calc_required_e(v_kmh: float, R: float, f_max: float) -> float:
+    """Required superelevation e (decimal) from v^2/(gR) = e + f; e = v^2/(gR) - f.
+    Clamped to [0, 0.12] for display purposes.
+    """
+    v = max(0.0, v_kmh) / 3.6
+    e_req = (v*v) / (G * R) - f_max
+    return float(np.clip(e_req, 0.0, 0.12))
+
+
+def superelevated_road(e: float, radius: float = 250.0, arc_len: float = 120.0, lane_w: float = 3.5, lanes: int = 2):
+    """3D surface of an arced, superelevated roadway (constant e)."""
+    total_w = lane_w * lanes
+    theta = arc_len / radius  # radians
+    t = np.linspace(0, theta, 160)
     x = radius * np.sin(t)
     y = radius * (1 - np.cos(t))
-    z = 0 * t
-    fig = go.Figure()
-    fig.add_trace(go.Scatter3d(x=x, y=y, z=z, mode='lines', line=dict(width=8)))
+    # Local road coordinates: along-arc s vs offset y_off; rotate offset by e
+    s = np.linspace(0, arc_len, 40)
+    y_off = np.linspace(-total_w/2, total_w/2, 16)
+    S, Y = np.meshgrid(s, y_off)
+    Z = -e * (Y)  # tilt about centerline
+
+    # Map S back to (x,y) along the precomputed plan arc by nearest indices
+    idx = (S / arc_len * (len(t)-1)).astype(int)
+    XX = x[idx]
+    YY = y[idx]
+
+    road = go.Surface(x=XX, y=YY + Y, z=Z, opacity=0.92)
+    center = go.Scatter3d(x=x, y=y, z=0*y, mode='lines', line=dict(width=6))
+
+    fig = go.Figure(data=[road, center])
     fig.update_layout(scene=dict(
-        xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='Z (m)'
+        xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='Elevation (m)'
     ), margin=dict(l=0, r=0, t=0, b=0))
     return fig
 
-# =============================== App UI =================================
-PAGES = ["Reference Q&A", "Topic Explorer", "3D Demos", "About"]
-page = st.sidebar.radio("Navigate", PAGES, index=0)
-
-# Load PDF + index once
+# ----------------------------- Load + Index -----------------------------
 pages_text, chunks = load_pdf(PDF_PATH)
 vectorizer, X = build_index(chunks)
 
-if page == "Reference Q&A":
-    st.title("📘 ATJ 8/86 — Reference Q&A")
-    if not pages_text:
-        st.error(f"PDF not found at {PDF_PATH}. Place the file in repo root.")
-        st.stop()
+# --------------------------------- UI -----------------------------------
+st.sidebar.title("ATJ 8/86 — Tools")
+view = st.sidebar.radio("Choose view", ["SSD on Grade", "Curve & Superelevation", "Free Q&A", "About"], index=0)
 
-    strict = st.sidebar.checkbox("Strict mode (refuse if weak evidence)", value=True)
-    k = st.sidebar.slider("Snippets to use", 1, MAX_SNIPPETS, 5)
+# =============================== SSD on Grade ===============================
+if view == "SSD on Grade":
+    st.title("🛑 Stopping Sight Distance on Grade — 3D & Reference")
 
-    q = st.text_input("Ask a question", placeholder="e.g., Explain stopping sight distance").strip()
-    if st.button("Search", use_container_width=True) and q:
+    cols = st.columns([1,1,1,1,1])
+    with cols[0]: v_kmh = st.number_input("Speed (km/h)", 10.0, 140.0, 80.0, 1.0)
+    with cols[1]: grade = st.number_input("Grade (%)  (+up / −down)", -12.0, 12.0, 0.0, 0.5)
+    with cols[2]: t_react = st.number_input("Reaction time t (s)", 0.5, 3.5, 2.5, 0.1)
+    with cols[3]: f = st.number_input("Friction f", 0.10, 0.60, 0.35, 0.01)
+    with cols[4]: lanes = st.slider("Lanes shown", 1, 4, 2)
+
+    out = calc_ssd(v_kmh, t_react, f, grade)
+    ssd = out["ssd"]
+
+    m1, m2 = st.columns([2,1])
+    with m1:
+        fig = ssd_scene(v_kmh, grade, ssd, lanes=lanes)
+        st.plotly_chart(fig, use_container_width=True)
+    with m2:
+        st.subheader("Results")
+        st.metric("Reaction distance (m)", f"{out['reaction']:.1f}")
+        st.metric("Braking distance (m)", f"{(np.inf if np.isinf(out['braking']) else round(out['braking'],1))}")
+        st.metric("SSD (m)", f"{(np.inf if np.isinf(ssd) else round(ssd,1))}")
+        if np.isinf(ssd):
+            st.warning("Parameters produce unrealistic SSD (denominator ≤ 0). Increase f or reduce downgrade.")
+
+    # PDF extracts for SSD keywords
+    st.divider()
+    st.subheader("PDF extracts — related to SSD & grades")
+    queries = ["stopping sight distance", "SSD", "grade", "braking", "perception reaction time"]
+    qtext = "; ".join(queries)
+    if pages_text:
+        hits = search_snippets(vectorizer, X, chunks, " ".join(queries), k=5)
+        for i, (score, ch) in enumerate(hits):
+            with st.expander(f"p.{ch.page} · score={score:.3f} · #{i}"):
+                st.markdown(highlight(ch.text, qtext), unsafe_allow_html=True)
+                if st.button(f"View page {ch.page}", key=f"ssd_view_{ch.page}_{i}"):
+                    st.session_state["selected_page"] = ch.page
+        if "selected_page" in st.session_state:
+            p = st.session_state["selected_page"]
+            st.markdown(f"**Full page {p}**")
+            st.markdown(_def_hl_css + highlight(pages_text[p-1], qtext) + "</div>", unsafe_allow_html=True)
+    else:
+        st.info(f"PDF not found at {PDF_PATH}.")
+
+# ============================ Curve & Superelevation ============================
+elif view == "Curve & Superelevation":
+    st.title("↪️ Horizontal Curve & Superelevation — 3D & Reference")
+
+    c1, c2, c3, c4 = st.columns([1,1,1,1])
+    with c1: v_kmh = st.number_input("Speed (km/h)", 20.0, 140.0, 80.0, 1.0, key="curve_v")
+    with c2: R = st.number_input("Radius R (m)", 30.0, 2000.0, 250.0, 5.0)
+    with c3: f_max = st.number_input("Max side friction f", 0.05, 0.25, 0.15, 0.01)
+    with c4: e_max = st.number_input("Max superelevation e_max (%)", 2.0, 12.0, 8.0, 0.5)
+
+    e_req = calc_required_e(v_kmh, R, f_max)  # decimal
+    e_max_dec = e_max / 100.0
+    ok = e_req <= e_max_dec + 1e-6
+
+    L_vis = st.slider("Visualized arc length (m)", 40.0, 300.0, 120.0, 5.0)
+    lanes = st.slider("Lanes shown", 1, 4, 2, key="curve_lanes")
+    lane_w = st.number_input("Lane width (m)", 2.75, 4.00, 3.50, 0.05, key="curve_lane_w")
+
+    g1, g2 = st.columns([2,1])
+    with g1:
+        fig2 = superelevated_road(e=min(e_req, e_max_dec), radius=R, arc_len=L_vis, lane_w=lane_w, lanes=lanes)
+        st.plotly_chart(fig2, use_container_width=True)
+    with g2:
+        st.subheader("Results")
+        st.metric("Required e (%)", f"{100*e_req:.2f}")
+        st.metric("Allowed e_max (%)", f"{e_max:.2f}")
+        st.success("Within e_max") if ok else st.error("Exceeds e_max — increase R or reduce speed.")
+
+    # PDF extracts for curve & e
+    st.divider()
+    st.subheader("PDF extracts — curves & superelevation")
+    queries = ["superelevation", "side friction", "horizontal curve", "minimum radius", "e ="]
+    qtext = "; ".join(queries)
+    if pages_text:
+        hits = search_snippets(vectorizer, X, chunks, " ".join(queries), k=5)
+        for i, (score, ch) in enumerate(hits):
+            with st.expander(f"p.{ch.page} · score={score:.3f} · #{i}"):
+                st.markdown(highlight(ch.text, qtext), unsafe_allow_html=True)
+                if st.button(f"View page {ch.page}", key=f"curve_view_{ch.page}_{i}"):
+                    st.session_state["selected_page"] = ch.page
+        if "selected_page" in st.session_state:
+            p = st.session_state["selected_page"]
+            st.markdown(f"**Full page {p}**")
+            st.markdown(_def_hl_css + highlight(pages_text[p-1], qtext) + "</div>", unsafe_allow_html=True)
+    else:
+        st.info(f"PDF not found at {PDF_PATH}.")
+
+# ================================== Free Q&A ==================================
+elif view == "Free Q&A":
+    st.title("🔎 Free Q&A over the PDF")
+
+    strict = st.sidebar.checkbox("Strict mode (refuse if weak evidence)", value=True, key="qa_strict")
+    k = st.sidebar.slider("Snippets to use", 1, MAX_SNIPPETS, 5, key="qa_k")
+
+    q = st.text_input("Ask a question", placeholder="e.g., Define transition curve or SSD factors").strip()
+    if st.button("Search", use_container_width=True, key="qa_btn") and q:
         if vectorizer is None:
-            st.error("Index not built.")
+            st.error("Index not built (PDF missing)")
         else:
-            q_vec = vectorizer.transform([q])
-            sims = cosine_similarity(q_vec, X).ravel()
-            order = sims.argsort()[::-1]
-            top_idx = order[:k]
-            results: List[Tuple[float, Chunk]] = [(float(sims[i]), chunks[i]) for i in top_idx]
-
-            if not results:
+            hits = search_snippets(vectorizer, X, chunks, q, k=k)
+            if not hits:
                 st.warning("No matches found.")
             else:
-                best_score, _ = results[0]
-                if strict and best_score < SIM_THRESHOLD:
+                best = hits[0][0]
+                if strict and best < SIM_THRESHOLD:
                     st.warning("Not in the guideline (ATJ 8/86).")
                 else:
-                    st.subheader("Top matches (with page numbers)")
-                    for idx, (score, ch) in enumerate(results):
-                        with st.expander(f"p.{ch.page} · score={score:.3f} · #{idx}"):
+                    st.subheader("Top matches")
+                    for i, (score, ch) in enumerate(hits):
+                        with st.expander(f"p.{ch.page} · score={score:.3f} · #{i}"):
                             st.markdown(highlight(ch.text, q), unsafe_allow_html=True)
-                            if st.button(f"View page {ch.page}", key=f"view_{ch.page}_{idx}"):
+                            if st.button(f"View page {ch.page}", key=f"qa_view_{ch.page}_{i}"):
                                 st.session_state["selected_page"] = ch.page
 
-                    # Full page view
-                    st.divider()
-                    sel = st.session_state.get("selected_page", results[0][1].page)
-                    st.markdown(f"### Full page reference — p.{sel}")
-                    raw = pages_text[sel-1]
-                    st.markdown(
-                        "<div style='white-space:pre-wrap; font-family: ui-monospace, monospace;'>" +
-                        highlight(raw, q) +
-                        "</div>", unsafe_allow_html=True,
-                    )
+                    if "selected_page" in st.session_state:
+                        p = st.session_state["selected_page"]
+                        st.markdown(f"**Full page {p}**")
+                        st.markdown(_def_hl_css + highlight(pages_text[p-1], q) + "</div>", unsafe_allow_html=True)
 
-                    if USE_OPENAI:
-                        ctx = "\n\n".join([f"(p.{c.page}) {c.text}" for _, c in results])
-                        try:
-                            resp = client.chat.completions.create(
-                                model=MODEL_NAME,
-                                messages=[
-                                    {"role": "system", "content": (
-                                        "Answer ONLY using the provided ATJ 8/86 context. "
-                                        "Cite pages like (p.X). If not present, reply 'Not in the guideline (ATJ 8/86)'."
-                                    )},
-                                    {"role": "user", "content": f"Question: {q}\n\nContext:\n{ctx}"}
-                                ], temperature=0.05,
-                            )
-                            st.markdown("### Composed answer")
-                            st.write(resp.choices[0].message.content)
-                        except Exception:
-                            st.info("OpenAI composition skipped.")
-
-elif page == "Topic Explorer":
-    st.title("📚 Topic Explorer (Editable)")
-    st.caption("High-level explanations. For exact wording/limits, refer to the PDF.")
-
-    # Topic & subtopic selectors
-    topic = st.selectbox("Topic", list(TOPICS.keys()))
-    sub = st.selectbox("Subtopic", list(TOPICS[topic].keys()))
-
-    st.subheader(f"{topic} — {sub}")
-    st.write(TOPICS[topic][sub])
-
-    # Link to reference: simple keyword search on demand
-    if pages_text and st.button("Find references in guideline"):
-        query = sub
-        q_vec = vectorizer.transform([query]) if vectorizer is not None else None
-        if q_vec is None:
-            st.error("Index not built.")
-        else:
-            sims = cosine_similarity(q_vec, X).ravel()
-            order = sims.argsort()[::-1][:3]
-            st.markdown("### Closest references")
-            for i, idx in enumerate(order):
-                ch = chunks[idx]
-                sc = float(sims[idx])
-                with st.expander(f"p.{ch.page} · score={sc:.3f} · #{i}"):
-                    st.write(ch.text)
-
-elif page == "3D Demos":
-    st.title("🧭 Basic 3D Graphical Demos")
-
-    tab1, tab2 = st.tabs(["Superelevation", "Horizontal curve path"])
-
-    with tab1:
-        e = st.slider("Superelevation e (%)", 0.0, 12.0, 6.0, 0.5)
-        lanes = st.slider("Number of lanes (both directions shown)", 1, 4, 2)
-        lane_w = st.number_input("Lane width (m)", 2.75, 4.0, 3.5, 0.05)
-        L = st.number_input("Visualized length (m)", 10.0, 200.0, 40.0, 1.0)
-        fig = demo_superelevation(e_percent=e, lane_width=lane_w, lanes=lanes, length=L)
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("Illustration only. Not to scale; for teaching the e% concept.")
-
-    with tab2:
-        R = st.number_input("Curve radius R (m)", 50.0, 1000.0, 250.0, 5.0)
-        s = st.number_input("Arc length (m)", 20.0, 500.0, 120.0, 5.0)
-        fig2 = demo_horizontal_curve(radius=R, arc_length=s)
-        st.plotly_chart(fig2, use_container_width=True)
-        st.caption("Plan-view arc shown in 3D axes for clarity.")
-
+# ==================================== About ====================================
 else:
     st.title("About this app")
     st.markdown(
-        "This educational companion helps explore ATJ 8/86 with quick references, curated explanations, and basic 3D demos. "
-        "For contractual work, always verify against the official guideline PDF included with the app."
+        "This interactive tool demonstrates practical highway design concepts with live 3D visuals and pulls related text from the bundled ATJ 8/86 PDF.\n"
+        "Use the extracts for *reference* and consult the official guideline for contractual decisions."
     )
-    st.markdown("**Authoring tips**: Edit the `TOPICS` dictionary in `app.py` to refine text; expand 3D demos as needed.")
+    st.markdown("**Tips**:\n- Tune friction and grade to see SSD sensitivities.\n- Explore different R and speed to see superelevation needs.\n- Add your own queries in Free Q&A for quick lookups.")
